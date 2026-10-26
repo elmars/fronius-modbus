@@ -77,14 +77,35 @@ class Storage(SunSpecComponent):
         await self.async_update()
         if revert_seconds:
             await self.write("revert_seconds", revert_seconds)
-        # the device refuses both rates negative, which reversing a forced
-        # direction passes through unless the negative rate goes last
-        rates = {"charge_limit": charge, "discharge_limit": discharge}
-        for field, limit in sorted(rates.items(), key=lambda rate: (rate[1] or 0) < 0):
-            if limit is not None:
+        # With both limits enabled the device refuses an empty window - a
+        # charge rate below the negated discharge rate, both negative for
+        # one. It checks when a limit is enabled, so a limit going off is
+        # disabled first, the rates follow with a negative one last, and a
+        # limit going on is enabled after them.
+        enabled = {
+            "charge_limit_enabled": charge is not None,
+            "discharge_limit_enabled": discharge is not None,
+        }
+        rates = [
+            (field, limit)
+            for field, limit in (
+                ("charge_limit", charge),
+                ("discharge_limit", discharge),
+            )
+            if limit is not None
+        ]
+        for enable_field, on in enabled.items():
+            if not on:
+                await self.write(enable_field, False)
+        for field, limit in rates:
+            if limit >= 0:
                 await self.write(field, limit)
-        await self.write("charge_limit_enabled", charge is not None)
-        await self.write("discharge_limit_enabled", discharge is not None)
+        for field, limit in rates:
+            if limit < 0:
+                await self.write(field, limit)
+        for enable_field, on in enabled.items():
+            if on:
+                await self.write(enable_field, True)
 
     @property
     def forced_mode(self) -> ForcedMode | None:
@@ -107,24 +128,39 @@ class Storage(SunSpecComponent):
             return None
         return ForcedMode.OFF
 
-    async def set_forced_mode(self, mode: ForcedMode) -> None:
+    async def set_forced_mode(
+        self, mode: ForcedMode, *, revert_seconds: int = 0
+    ) -> None:
         """Force the battery to charge or discharge at full power, or stop.
 
         Forcing takes over the rate of the opposite direction - a negative
         discharge rate is what forces charging - and charging also enables
         grid charging. The rate of the forced direction is left alone, so an
         active limit there caps the forced power: the device refuses a forced
-        rate beyond it, so the forced rate is capped to match.
+        rate beyond it, so the forced rate is capped to match. A limit of 0%
+        there leaves nothing to force and raises ``ValueError``.
 
-        Stopping releases a forcing rate at 100% and disabled, and grid
-        charging with forced charging. A rate is released first when the
-        other direction takes over, as the device refuses both negative.
+        Stopping releases any negative rate at 100% and disabled - also one
+        whose limit is off already, as a revert or another controller leaves
+        behind, so a limit enabled later can't pick it up - and grid charging
+        with a negative discharge rate. With no negative rate it writes
+        nothing. A rate is released first when the other direction takes
+        over, as the device refuses both negative.
+
+        ``revert_seconds`` > 0 is written first and auto-reverts the forcing
+        if it isn't refreshed. A Gen24 then disables both limits but keeps
+        the rates and grid charging, which reads back as ``OFF``.
         """
         await self.async_update()
         # writes don't update the model, so decide everything from this read
         charge, discharge = self.charge_limit, self.discharge_limit
         charge_cap = _user_limit(charge, self.charge_limit_enabled)
         discharge_cap = _user_limit(discharge, self.discharge_limit_enabled)
+        cap = {ForcedMode.CHARGE: charge_cap, ForcedMode.DISCHARGE: discharge_cap}
+        if cap.get(mode) == 0:
+            raise ValueError(f"a {mode} limit of 0% leaves nothing to force")
+        if revert_seconds:
+            await self.write("revert_seconds", revert_seconds)
         if mode is not ForcedMode.CHARGE and _negative(discharge):
             await self._release("discharge_limit", "discharge_limit_enabled")
             await self.write("grid_charging", False)

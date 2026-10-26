@@ -168,20 +168,25 @@ def _signed(word: object) -> int:
     return word - 0x10000 if word & 0x8000 else word
 
 
-def _refuse_both_rates_negative(
-    unit: MockModbusUnit, data_address: int
-) -> list[tuple[int, int]]:
-    """Record the rates after every write, as the device refuses both negative."""
-    rates: list[tuple[int, int]] = []
+def _refuse_empty_window(unit: MockModbusUnit, data_address: int) -> None:
+    """Fail a write that leaves a state a Gen24 refuses.
+
+    With both limits enabled, battery power has to fit between the negated
+    discharge rate and the charge rate - measured: both -30% is refused,
+    40% / -100% is refused, 40% / -40% charges at 40%. With one limit
+    enabled any rates are taken.
+    """
+    states: list[tuple[int, int, int]] = []
 
     def check(_event: WriteEvent) -> None:
+        mode = unit.holding[data_address + 3]  # StorCtl_Mod
+        assert isinstance(mode, int)
         charge = _signed(unit.holding[data_address + 11])  # InWRte
         discharge = _signed(unit.holding[data_address + 10])  # OutWRte
-        rates.append((charge, discharge))
-        assert not (charge < 0 and discharge < 0), rates
+        states.append((mode & 0b11, charge, discharge))
+        assert mode & 0b11 != 0b11 or charge + discharge >= 0, states
 
     unit.on_write(check)
-    return rates
 
 
 async def test_reversing_limits_never_sets_both_negative(
@@ -194,13 +199,38 @@ async def test_reversing_limits_never_sets_both_negative(
     storage = _storage(inverter)
     data_address = _model_data_address(inverter, STORAGE_MODEL_ID)
     await storage.set_limits(charge=100.0, discharge=-100.0)
-    _refuse_both_rates_negative(mock_modbus_unit, data_address)
+    _refuse_empty_window(mock_modbus_unit, data_address)
 
     await storage.set_limits(charge=-100.0, discharge=100.0)
 
     await storage.async_update()
     assert storage.charge_limit == -100.0
     assert storage.discharge_limit == 100.0
+
+
+async def test_reversing_a_single_limit_never_leaves_an_empty_window(
+    mock_modbus_unit: MockModbusUnit,
+) -> None:
+    """Test the limit going off is disabled before the other goes negative.
+
+    Measured on a Gen24: from forced charging at -30%, disabling the
+    discharge limit first, then writing the charge rate -30% and enabling
+    it, is taken and discharges at 30%.
+    """
+    inverter = await _discovered_inverter(
+        mock_modbus_unit, build_sunspec_map([], storage_wcha_max=12800)
+    )
+    storage = _storage(inverter)
+    data_address = _model_data_address(inverter, STORAGE_MODEL_ID)
+    await storage.set_limits(discharge=-30.0)
+    _refuse_empty_window(mock_modbus_unit, data_address)
+
+    await storage.set_limits(charge=-30.0)
+
+    await storage.async_update()
+    assert _forced_mode(storage) is ForcedMode.DISCHARGE
+    assert storage.charge_limit_enabled is True
+    assert storage.discharge_limit_enabled is False
 
 
 async def test_forced_mode_reads_back(mock_modbus_unit: MockModbusUnit) -> None:
@@ -310,14 +340,92 @@ async def test_reversing_forced_mode_never_sets_both_negative(
     storage = _storage(inverter)
     data_address = _model_data_address(inverter, STORAGE_MODEL_ID)
     await storage.set_forced_mode(start)
-    _refuse_both_rates_negative(mock_modbus_unit, data_address)
+    _refuse_empty_window(mock_modbus_unit, data_address)
 
     await storage.set_forced_mode(target)
 
     await storage.async_update()
     assert _forced_mode(storage) is target
-    assert -100.0 in (storage.charge_limit, storage.discharge_limit)
+    if target is ForcedMode.CHARGE:
+        assert (storage.charge_limit, storage.discharge_limit) == (100.0, -100.0)
+    else:
+        assert (storage.charge_limit, storage.discharge_limit) == (-100.0, 100.0)
     assert storage.grid_charging is (target is ForcedMode.CHARGE)
+
+
+async def test_forced_mode_writes_the_revert_period_first(
+    mock_modbus_unit: MockModbusUnit,
+) -> None:
+    """Test forcing can auto-revert, armed before anything else is written."""
+    inverter = await _discovered_inverter(
+        mock_modbus_unit, build_sunspec_map([], storage_wcha_max=12800)
+    )
+    storage = _storage(inverter)
+    data_address = _model_data_address(inverter, STORAGE_MODEL_ID)
+    writes: list[WriteEvent] = []
+    mock_modbus_unit.on_write(writes.append)
+
+    await storage.set_forced_mode(ForcedMode.CHARGE, revert_seconds=60)
+
+    assert writes[0].address == data_address + 13  # InOutWRte_RvrtTms
+    await storage.async_update()
+    assert storage.revert_seconds == 60
+    assert _forced_mode(storage) is ForcedMode.CHARGE
+
+
+@pytest.mark.parametrize(
+    ("mode", "charge", "discharge"),
+    [(ForcedMode.CHARGE, 0.0, None), (ForcedMode.DISCHARGE, None, 0.0)],
+)
+async def test_forcing_against_a_zero_limit_is_refused(
+    mock_modbus_unit: MockModbusUnit,
+    mode: ForcedMode,
+    charge: float | None,
+    discharge: float | None,
+) -> None:
+    """Test a 0% limit in the forced direction raises instead of holding.
+
+    Capped to 0% the forcing rate would block the battery both ways while
+    reading back as not forced.
+    """
+    inverter = await _discovered_inverter(
+        mock_modbus_unit, build_sunspec_map([], storage_wcha_max=12800)
+    )
+    storage = _storage(inverter)
+    await storage.set_limits(charge=charge, discharge=discharge)
+    writes: list[WriteEvent] = []
+    mock_modbus_unit.on_write(writes.append)
+
+    with pytest.raises(ValueError, match="0%"):
+        await storage.set_forced_mode(mode)
+
+    assert writes == []
+
+
+async def test_stopping_releases_a_rate_a_revert_left_behind(
+    mock_modbus_unit: MockModbusUnit,
+) -> None:
+    """Test off clears a negative rate whose limit is already off.
+
+    A Gen24 reverting a forced charge disables the limits but keeps the rate
+    and grid charging - not forced, but a trap for the next limit enabled.
+    """
+    inverter = await _discovered_inverter(
+        mock_modbus_unit, build_sunspec_map([], storage_wcha_max=12800)
+    )
+    storage = _storage(inverter)
+    await storage.set_forced_mode(ForcedMode.CHARGE)
+    await storage.set_limits()  # what the revert leaves: limits off, rates kept
+    await storage.async_update()
+    assert _forced_mode(storage) is ForcedMode.OFF
+    assert storage.discharge_limit == -100.0
+
+    await storage.set_forced_mode(ForcedMode.OFF)
+
+    await storage.async_update()
+    assert storage.discharge_limit == 100.0
+    assert storage.discharge_limit_enabled is False
+    assert storage.grid_charging is False
 
 
 async def test_stopping_when_not_forced_writes_nothing(
