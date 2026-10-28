@@ -11,7 +11,7 @@ register map before anything is written. Register addresses relative to the
 model start, per the SunSpec model 124 definition.
 """
 
-from enum import IntEnum, StrEnum
+from enum import IntEnum
 
 from modbus_connection.model import bit
 from modbus_connection.model import sunspec as sunspec_fields
@@ -29,14 +29,6 @@ class StorageState(IntEnum):
     FULL = 5
     HOLDING = 6
     TESTING = 7
-
-
-class ForcedMode(StrEnum):
-    """Which way a negative rate limit forces the battery."""
-
-    OFF = "off"
-    CHARGE = "charge"
-    DISCHARGE = "discharge"
 
 
 class Storage(SunSpecComponent):
@@ -107,81 +99,6 @@ class Storage(SunSpecComponent):
             if on:
                 await self.write(enable_field, True)
 
-    @property
-    def forced_mode(self) -> ForcedMode | None:
-        """Return which way an active negative rate forces the battery.
-
-        A negative discharge rate forces charging and a negative charge rate
-        forces discharging - whoever wrote it, so forcing by another
-        controller reads back too.
-        """
-        if self.discharge_limit_enabled and _negative(self.discharge_limit):
-            return ForcedMode.CHARGE
-        if self.charge_limit_enabled and _negative(self.charge_limit):
-            return ForcedMode.DISCHARGE
-        if None in (
-            self.charge_limit,
-            self.discharge_limit,
-            self.charge_limit_enabled,
-            self.discharge_limit_enabled,
-        ):
-            return None
-        return ForcedMode.OFF
-
-    async def set_forced_mode(
-        self, mode: ForcedMode, *, revert_seconds: int = 0
-    ) -> None:
-        """Force the battery to charge or discharge at full power, or stop.
-
-        Forcing takes over the rate of the opposite direction - a negative
-        discharge rate is what forces charging - and charging also enables
-        grid charging. The rate of the forced direction is left alone, so an
-        active limit there caps the forced power: the device refuses a forced
-        rate beyond it, so the forced rate is capped to match. A limit of 0%
-        there leaves nothing to force and raises ``ValueError``.
-
-        Stopping releases any negative rate at 100% and disabled - also one
-        whose limit is off already, as a revert or another controller leaves
-        behind, so a limit enabled later can't pick it up - and grid charging
-        with a negative discharge rate. With no negative rate it writes
-        nothing. A rate is released first when the other direction takes
-        over, as the device refuses both negative.
-
-        ``revert_seconds`` > 0 is written first and auto-reverts the forcing
-        if it isn't refreshed. A Gen24 then disables both limits but keeps
-        the rates and grid charging, which reads back as ``OFF``.
-        """
-        await self.async_update()
-        # writes don't update the model, so decide everything from this read
-        charge, discharge = self.charge_limit, self.discharge_limit
-        charge_cap = _user_limit(charge, self.charge_limit_enabled)
-        discharge_cap = _user_limit(discharge, self.discharge_limit_enabled)
-        cap = {ForcedMode.CHARGE: charge_cap, ForcedMode.DISCHARGE: discharge_cap}
-        if cap.get(mode) == 0:
-            raise ValueError(f"a {mode} limit of 0% leaves nothing to force")
-        if revert_seconds:
-            await self.write("revert_seconds", revert_seconds)
-        if mode is not ForcedMode.CHARGE and _negative(discharge):
-            await self._release("discharge_limit", "discharge_limit_enabled")
-            await self.write("grid_charging", False)
-        if mode is not ForcedMode.DISCHARGE and _negative(charge):
-            await self._release("charge_limit", "charge_limit_enabled")
-        if mode is ForcedMode.CHARGE:
-            await self.write("grid_charging", True)
-            await self._force("discharge_limit", "discharge_limit_enabled", charge_cap)
-        elif mode is ForcedMode.DISCHARGE:
-            await self._force("charge_limit", "charge_limit_enabled", discharge_cap)
-
-    async def _release(self, field: str, enable_field: str) -> None:
-        """Stop a rate from forcing, leaving no negative value behind."""
-        await self.write(enable_field, False)
-        await self.write(field, 100)
-
-    async def _force(self, field: str, enable_field: str, cap: float | None) -> None:
-        """Force with the opposite rate, capped by the user's limit."""
-        await self.write(field, -(100 if cap is None else min(100, cap)))
-        await self.write(enable_field, True)
-
     async def set_minimum_reserve(self, percent: float) -> None:
         """Set the minimum state of charge reserve in percent."""
         if not 0 <= percent <= 100:
@@ -197,14 +114,3 @@ class Storage(SunSpecComponent):
         """
         await self.async_update()
         await self.write("grid_charging", enabled)
-
-
-def _negative(limit: float | None) -> bool:
-    return limit is not None and limit < 0
-
-
-def _user_limit(limit: float | None, enabled: bool | None) -> float | None:
-    """Return an active limit the user set - a negative one is forcing."""
-    if not enabled or limit is None or limit < 0:
-        return None
-    return limit
